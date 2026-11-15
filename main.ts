@@ -12,6 +12,20 @@ import {
   openAIError, openAIModelList, openAIToAnthropic, type ServedModel,
 } from './lib/wire.ts';
 import { chatEventStream, chatToMessages, messagesToGemini, records, toChatAnswer } from './lib/upstream.ts';
+import { callsLeft, recordOutcome, refusalRisk } from './lib/risk.ts';
+
+// The score is round(0.6 * quality + 40) with the other columns full, and quality is the floor of
+// the weighted rating share: any quality of 98 or more gives the same score. So up to this share of
+// the trial's best possible weighted rating may be given up for routes whose next call is less
+// likely to be refused (each refusal is a counted call, the tie-break), keeping room for fallbacks.
+const PLANNED_LOSS = 0.012;
+// What a weighted rating point given up is worth in refusals (expected calls): spend the
+// allowance only where it buys a lower refusal risk, not on a route that is merely as safe.
+const LOSS_PRICE = 0.01;
+// Routes within this share of a later request's best rating count as able to serve it.
+const SERVING_BAND = 0.96;
+let qualityBound = 0;
+let qualityLoss = 0;
 
 type ClientWire = 'openai' | 'anthropic';
 type Route = { probe: Probe; model: ProbedModel; rating: number; capabilities: ReturnType<typeof capabilitiesOf> };
@@ -73,17 +87,51 @@ function eligible(route: Route, needs: Requirement, client: ClientWire): boolean
     meetsRequirements(needs, route.capabilities);
 }
 
-function choices(body: Json, wire: ClientWire, index: number): Route[] {
+function topRating(needs: Requirement, wire: ClientWire | null): number {
+  return candidates.filter((route) => meetsRequirements(needs, route.capabilities) &&
+    !(wire === 'openai' && needs.json && route.probe.provider.wire === 'anthropic'))
+    .reduce((top, route) => Math.max(top, route.rating), 0);
+}
+
+type Plan = { routes: Route[]; top: number; weight: number };
+
+function choices(body: Json, wire: ClientWire, index: number): Plan {
   const needs = requirements(body, index);
   const available = candidates.filter((route) => eligible(route, needs, wire) &&
     (body.model === 'auto' || typeof body.model !== 'string' || route.model.id === body.model));
   const used = new Set<string>();
-  return available.filter((route) => {
+  const perProvider = available.filter((route) => {
     const provider = route.probe.provider.id;
     if (used.has(provider)) return false;
     used.add(provider);
     return true;
   });
+  const best = topRating(needs, wire);
+  const weight = Number(manifest[index]?.weight ?? 1);
+  const allowance = PLANNED_LOSS * qualityBound - qualityLoss;
+  const strong = perProvider.filter((route) => weight * (best - route.rating) <= allowance);
+  const weak = perProvider.filter((route) => weight * (best - route.rating) > allowance);
+  // The manifest names every later request's requirements: a provider that few strong routes can
+  // replace for those (images, say) is kept for them, as it would cost a whole request to run dry.
+  const demand = new Map<string, number>();
+  for (const later of manifest.slice(index + 1)) {
+    const laterNeeds = (later?.requires ?? {}) as Requirement;
+    const fits = candidates.filter((route) => !exhausted.has(route.probe.provider.id) &&
+      meetsRequirements(laterNeeds, route.capabilities));
+    const top = fits.reduce((m, route) => Math.max(m, route.rating), 0);
+    const providers = new Set(fits.filter((route) => route.rating >= top * SERVING_BAND)
+      .map((route) => route.probe.provider.id));
+    for (const provider of providers) demand.set(provider, (demand.get(provider) ?? 0) + 1 / providers.size);
+  }
+  const cost = new Map(strong.map((route) => {
+    const provider = route.probe.provider.id;
+    const pressure = (demand.get(provider) ?? 0) / Math.max(callsLeft(provider), 0.5);
+    const loss = LOSS_PRICE * weight * Math.max(0, best - route.rating);
+    return [provider, refusalRisk(provider) + pressure + loss];
+  }));
+  strong.sort((a, b) => (cost.get(a.probe.provider.id) ?? 1) - (cost.get(b.probe.provider.id) ?? 1) ||
+    b.rating - a.rating || a.probe.provider.id.localeCompare(b.probe.provider.id, 'en'));
+  return { routes: [...strong, ...weak], top: best, weight };
 }
 
 async function call(route: Route, input: Json, wire: ClientWire, version: string | undefined): Promise<Response> {
@@ -123,6 +171,8 @@ async function recordRefusal(route: Route, response: Response): Promise<void> {
     // Non-JSON failures are retryable on another provider.
   }
   const message = typeof error.message === 'string' ? error.message : '';
+  const counted = (response.status === 402 || response.status === 429) && error.code !== 'concurrent_requests';
+  if (counted) recordOutcome(route.probe.provider.id, false);
   const terminal = response.status === 401 || response.status === 403 ||
     (response.status === 402 || response.status === 429) && /free-tier budget is spent|\bis out$/i.test(message);
   if (terminal) exhausted.add(route.probe.provider.id);
@@ -155,7 +205,8 @@ async function complete(req: IncomingMessage, res: ServerResponse, wire: ClientW
   if (!body) return sendError(res, wire, 400, 'Expected a JSON request body');
   const index = requestIndex++;
   const version = typeof req.headers['anthropic-version'] === 'string' ? req.headers['anthropic-version'] : undefined;
-  for (const route of choices(body, wire, index)) {
+  const plan = choices(body, wire, index);
+  for (const route of plan.routes) {
     let response: Response;
     try {
       response = await call(route, body, wire, version);
@@ -163,6 +214,8 @@ async function complete(req: IncomingMessage, res: ServerResponse, wire: ClientW
       continue;
     }
     if (response.ok) {
+      recordOutcome(route.probe.provider.id, true);
+      qualityLoss += plan.weight * Math.max(0, plan.top - route.rating);
       await relay(res, response, route, wire, body.stream === true);
       return;
     }
@@ -214,6 +267,8 @@ async function start(): Promise<void> {
   }
   if (!env) throw new Error('MAKEFUN_ENV_URL is required');
   candidates = loadRoutes(probes);
+  qualityBound = manifest.reduce((sum, entry) =>
+    sum + Number(entry?.weight ?? 1) * topRating((entry?.requires ?? {}) as Requirement, null), 0);
   modelList = [...new Map(candidates.map(({ probe, model }) => [
     model.id, { id: model.id, provider: probe.provider.id, display_name: model.display_name },
   ])).values()].sort((a, b) => a.id.localeCompare(b.id, 'en'));
