@@ -1,0 +1,254 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { setTimeout as delay } from 'node:timers/promises';
+import {
+  authHeaders, buildCatalog, capabilitiesOf, isRecord, joinBase, meetsRequirements,
+  modelFree, probeProvider, ratingOfModel, readBrief,
+  type Json, type Probe, type ProbedModel, type Requirement,
+} from './lib/providers.ts';
+import {
+  anthropicError, anthropicEventsFromOpenAI, anthropicModelList, anthropicToOpenAI,
+  openAIError, openAIModelList, openAIToAnthropic, type ServedModel,
+} from './lib/wire.ts';
+import { chatEventStream, chatToMessages, messagesToGemini, records, toChatAnswer } from './lib/upstream.ts';
+
+type ClientWire = 'openai' | 'anthropic';
+type Route = { probe: Probe; model: ProbedModel; rating: number; capabilities: ReturnType<typeof capabilitiesOf> };
+
+const env = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+const brief = readBrief(process.env.MAKEFUN_PROMPT_FILE ?? '');
+const manifest = brief.workload?.manifest ?? [];
+const exhausted = new Set<string>();
+let requestIndex = 0;
+let candidates: Route[] = [];
+let modelList: ServedModel[] = [];
+let outstanding: Promise<void> = Promise.resolve();
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const data = JSON.stringify(body);
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(data) });
+  res.end(data);
+}
+
+function sendError(res: ServerResponse, wire: ClientWire, status: number, message: string): void {
+  const type = status === 400 ? 'invalid_request_error' : status === 404 ? 'not_found_error' : 'overloaded_error';
+  sendJson(res, status, wire === 'anthropic' ? anthropicError(type, message) : openAIError(message, type, null));
+}
+
+async function readBody(req: IncomingMessage): Promise<Json | null> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > 32 * 1024 * 1024) return null;
+    chunks.push(buffer);
+  }
+  try {
+    const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return isRecord(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function requirements(body: Json, index: number): Requirement {
+  const declared = manifest[index]?.requires;
+  const format = isRecord(body.response_format) ? body.response_format.type : null;
+  const vision = records(body.messages).some((message) =>
+    records(message.content).some((block) => block.type === 'image' || block.type === 'image_url'),
+  );
+  return {
+    ...declared,
+    tools: declared?.tools || records(body.tools).length > 0,
+    vision: declared?.vision || vision,
+    json: declared?.json || format === 'json_object' || format === 'json_schema',
+  };
+}
+
+function eligible(route: Route, needs: Requirement, client: ClientWire): boolean {
+  return !exhausted.has(route.probe.provider.id) &&
+    !(client === 'openai' && needs.json && route.probe.provider.wire === 'anthropic') &&
+    meetsRequirements(needs, route.capabilities);
+}
+
+function choices(body: Json, wire: ClientWire, index: number): Route[] {
+  const needs = requirements(body, index);
+  const available = candidates.filter((route) => eligible(route, needs, wire) &&
+    (body.model === 'auto' || typeof body.model !== 'string' || route.model.id === body.model));
+  const used = new Set<string>();
+  return available.filter((route) => {
+    const provider = route.probe.provider.id;
+    if (used.has(provider)) return false;
+    used.add(provider);
+    return true;
+  });
+}
+
+async function call(route: Route, input: Json, wire: ClientWire, version: string | undefined): Promise<Response> {
+  const provider = route.probe.provider;
+  const base = joinBase(env, provider.base);
+  const key = process.env[provider.key_env] ?? provider.key;
+  const headers = { 'content-type': 'application/json', ...authHeaders(provider.auth, key) };
+  const stream = input.stream === true;
+  const model = route.model.id;
+  let path: string;
+  let payload: Json;
+  if (provider.wire === 'openai') {
+    path = '/v1/chat/completions';
+    payload = wire === 'openai' ? { ...input, model } : anthropicToOpenAI(input, model);
+    if (stream) payload.stream_options = { ...(isRecord(payload.stream_options) ? payload.stream_options : {}), include_usage: true };
+  } else {
+    const messages = wire === 'anthropic' ? { ...input, model } : chatToMessages(input, model);
+    if (provider.wire === 'anthropic') {
+      path = '/v1/messages';
+      payload = messages;
+      headers['anthropic-version'] = version ?? '2023-06-01';
+    } else {
+      const operation = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
+      path = '/v1beta/models/' + encodeURIComponent(model) + ':' + operation;
+      payload = messagesToGemini(messages, input.response_format);
+    }
+  }
+  return fetch(base + path, { method: 'POST', headers, body: JSON.stringify(payload), redirect: 'error', signal: AbortSignal.timeout(10000) });
+}
+
+async function recordRefusal(route: Route, response: Response): Promise<void> {
+  let error: Json = {};
+  try {
+    const value: unknown = await response.json();
+    if (isRecord(value) && isRecord(value.error)) error = value.error;
+  } catch {
+    // Non-JSON failures are retryable on another provider.
+  }
+  const message = typeof error.message === 'string' ? error.message : '';
+  const terminal = response.status === 401 || response.status === 403 ||
+    (response.status === 402 || response.status === 429) && /free-tier budget is spent|\bis out$/i.test(message);
+  if (terminal) exhausted.add(route.probe.provider.id);
+}
+
+async function relay(res: ServerResponse, response: Response, route: Route, wire: ClientWire, stream: boolean): Promise<void> {
+  const source = route.probe.provider.wire;
+  const model = route.model.id;
+  if (!stream) {
+    const answer: unknown = await response.json();
+    if (!isRecord(answer)) throw new Error('Provider response is not a JSON object');
+    const chat = source === 'openai' ? answer : source === wire ? null : toChatAnswer(answer, source, model);
+    const output = source === wire ? answer : wire === 'openai' ? chat : openAIToAnthropic(chat ?? {}, model);
+    sendJson(res, 200, output);
+    return;
+  }
+  if (!response.body) throw new Error('Provider response is missing a stream');
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+  if (source === wire) {
+    await pipeline(Readable.fromWeb(response.body), res);
+    return;
+  }
+  const chat = source === 'openai' ? response.body : chatEventStream(response.body, source, model);
+  const output = wire === 'openai' ? Readable.fromWeb(chat) : Readable.from(anthropicEventsFromOpenAI(chat, model));
+  await pipeline(output, res);
+}
+
+async function complete(req: IncomingMessage, res: ServerResponse, wire: ClientWire): Promise<void> {
+  const body = await readBody(req);
+  if (!body) return sendError(res, wire, 400, 'Expected a JSON request body');
+  const index = requestIndex++;
+  const version = typeof req.headers['anthropic-version'] === 'string' ? req.headers['anthropic-version'] : undefined;
+  for (const route of choices(body, wire, index)) {
+    let response: Response;
+    try {
+      response = await call(route, body, wire, version);
+    } catch {
+      continue;
+    }
+    if (response.ok) {
+      await relay(res, response, route, wire, body.stream === true);
+      return;
+    }
+    await recordRefusal(route, response);
+  }
+  sendError(res, wire, 503, 'No available free model can serve this request');
+}
+
+function handle(req: IncomingMessage, res: ServerResponse): void {
+  const path = new URL(req.url ?? '/', 'http://aggregator').pathname;
+  if (req.method === 'GET' && path === '/v1/models') {
+    const wire = typeof req.headers['x-api-key'] === 'string';
+    return sendJson(res, 200, wire ? anthropicModelList(modelList) : openAIModelList(modelList));
+  }
+  const wire = path === '/v1/messages' ? 'anthropic' : 'openai';
+  if (req.method !== 'POST' || (path !== '/v1/messages' && path !== '/v1/chat/completions')) {
+    return sendError(res, wire, 404, 'Unknown API route');
+  }
+  outstanding = outstanding.then(() => complete(req, res, wire)).catch((error: Error) => {
+    process.stderr.write('Provider relay failed: ' + error.message + '\n');
+    if (res.headersSent) res.destroy();
+    else sendError(res, wire, 502, 'Provider relay failed');
+  });
+}
+
+function loadRoutes(probes: Probe[]): Route[] {
+  return probes.flatMap((probe) => probe.models.flatMap((model) => {
+    const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+    return modelFree(model, row)
+      ? [{ probe, model, rating: row?.rating_milli ?? 0, capabilities: capabilitiesOf(model, row) }]
+      : [];
+  })).sort((a, b) => b.rating - a.rating || a.probe.provider.id.localeCompare(b.probe.provider.id, 'en') ||
+    a.model.id.localeCompare(b.model.id, 'en'));
+}
+
+async function start(): Promise<void> {
+  const probes: Probe[] = [];
+  if (env) {
+    for (const provider of brief.directory.providers) {
+      const probe = await probeProvider(env, { ...provider, key: process.env[provider.key_env] ?? provider.key });
+      if (probe.error) process.stderr.write(probe.error + '\n');
+      probes.push(probe);
+    }
+  }
+  const catalog = buildCatalog(env, probes, brief.ratings);
+  if (process.argv.includes('--list')) {
+    process.stdout.write(JSON.stringify(catalog) + '\n');
+    return;
+  }
+  if (!env) throw new Error('MAKEFUN_ENV_URL is required');
+  candidates = loadRoutes(probes);
+  modelList = [...new Map(candidates.map(({ probe, model }) => [
+    model.id, { id: model.id, provider: probe.provider.id, display_name: model.display_name },
+  ])).values()].sort((a, b) => a.id.localeCompare(b.id, 'en'));
+  const server = createServer(handle);
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '0.0.0.0', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('The server failed to bind to a TCP port');
+  try {
+    const response = await fetch(env + '/register', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ protocol_version: 1, port: address.port, catalog }),
+      signal: AbortSignal.timeout(5000), redirect: 'error',
+    });
+    if (!response.ok) throw new Error('Registration failed with HTTP ' + response.status);
+    await response.arrayBuffer();
+    let missedPolls = 0;
+    for (;;) {
+      try {
+        const check = await fetch(env + '/work', { signal: AbortSignal.timeout(2000), redirect: 'error' });
+        if (!check.ok) throw new Error('Work endpoint returned HTTP ' + check.status);
+        const work: unknown = await check.json();
+        if (isRecord(work) && work.done === true) break;
+        missedPolls = 0;
+      } catch (error) {
+        if (++missedPolls === 3) throw error;
+      }
+      await delay(200);
+    }
+    await outstanding;
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+await start();
