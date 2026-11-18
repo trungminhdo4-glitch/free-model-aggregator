@@ -206,6 +206,7 @@ async function complete(req: IncomingMessage, res: ServerResponse, wire: ClientW
   const index = requestIndex++;
   const version = typeof req.headers['anthropic-version'] === 'string' ? req.headers['anthropic-version'] : undefined;
   const plan = choices(body, wire, index);
+  let relayError: unknown;
   for (const route of plan.routes) {
     let response: Response;
     try {
@@ -213,14 +214,22 @@ async function complete(req: IncomingMessage, res: ServerResponse, wire: ClientW
     } catch {
       continue;
     }
-    if (response.ok) {
-      recordOutcome(route.probe.provider.id, true);
-      qualityLoss += plan.weight * Math.max(0, plan.top - route.rating);
-      await relay(res, response, route, wire, body.stream === true);
-      return;
+    if (!response.ok) {
+      await recordRefusal(route, response);
+      continue;
     }
-    await recordRefusal(route, response);
+    try {
+      await relay(res, response, route, wire, body.stream === true);
+    } catch (error) {
+      if (res.headersSent || res.destroyed) throw error;
+      relayError = error;
+      continue;
+    }
+    recordOutcome(route.probe.provider.id, true);
+    qualityLoss += plan.weight * Math.max(0, plan.top - route.rating);
+    return;
   }
+  if (relayError !== undefined) throw relayError;
   sendError(res, wire, 503, 'No available free model can serve this request');
 }
 
