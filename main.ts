@@ -134,7 +134,7 @@ function choices(body: Json, wire: ClientWire, index: number): Plan {
   return { routes: [...strong, ...weak], top: best, weight };
 }
 
-async function call(route: Route, input: Json, wire: ClientWire, version: string | undefined): Promise<Response> {
+async function call(route: Route, input: Json, wire: ClientWire, version: string | undefined, signal: AbortSignal): Promise<Response> {
   const provider = route.probe.provider;
   const base = joinBase(env, provider.base);
   const key = process.env[provider.key_env] ?? provider.key;
@@ -159,7 +159,10 @@ async function call(route: Route, input: Json, wire: ClientWire, version: string
       payload = messagesToGemini(messages, input.response_format);
     }
   }
-  return fetch(base + path, { method: 'POST', headers, body: JSON.stringify(payload), redirect: 'error', signal: AbortSignal.timeout(10000) });
+  return fetch(base + path, {
+    method: 'POST', headers, body: JSON.stringify(payload), redirect: 'error',
+    signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
+  });
 }
 
 async function recordRefusal(route: Route, response: Response): Promise<void> {
@@ -200,18 +203,21 @@ async function relay(res: ServerResponse, response: Response, route: Route, wire
   await pipeline(output, res);
 }
 
-async function complete(req: IncomingMessage, res: ServerResponse, wire: ClientWire): Promise<void> {
+async function complete(req: IncomingMessage, res: ServerResponse, wire: ClientWire, signal: AbortSignal): Promise<void> {
   const body = await readBody(req);
+  if (signal.aborted) return;
   if (!body) return sendError(res, wire, 400, 'Expected a JSON request body');
   const index = requestIndex++;
   const version = typeof req.headers['anthropic-version'] === 'string' ? req.headers['anthropic-version'] : undefined;
   const plan = choices(body, wire, index);
   let relayError: unknown;
   for (const route of plan.routes) {
+    if (signal.aborted) return;
     let response: Response;
     try {
-      response = await call(route, body, wire, version);
+      response = await call(route, body, wire, version, signal);
     } catch {
+      if (signal.aborted) return;
       continue;
     }
     if (!response.ok) {
@@ -221,6 +227,7 @@ async function complete(req: IncomingMessage, res: ServerResponse, wire: ClientW
     try {
       await relay(res, response, route, wire, body.stream === true);
     } catch (error) {
+      if (signal.aborted) return;
       if (res.headersSent || res.destroyed) throw error;
       relayError = error;
       continue;
@@ -243,10 +250,25 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
   if (req.method !== 'POST' || (path !== '/v1/messages' && path !== '/v1/chat/completions')) {
     return sendError(res, wire, 404, 'Unknown API route');
   }
-  outstanding = outstanding.then(() => complete(req, res, wire)).catch((error: Error) => {
+  const disconnected = new AbortController();
+  const onDisconnect = () => {
+    // IncomingMessage 'close' also fires after a normal upload; response close
+    // before writableFinished identifies the client going away instead.
+    if (!res.writableFinished) disconnected.abort();
+  };
+  res.once('close', onDisconnect);
+  req.once('aborted', onDisconnect);
+  outstanding = outstanding.then(() => {
+    if (disconnected.signal.aborted || res.destroyed) return;
+    return complete(req, res, wire, disconnected.signal);
+  }).catch((error: Error) => {
+    if (disconnected.signal.aborted || res.destroyed) return;
     process.stderr.write('Provider relay failed: ' + error.message + '\n');
     if (res.headersSent) res.destroy();
     else sendError(res, wire, 502, 'Provider relay failed');
+  }).finally(() => {
+    res.removeListener('close', onDisconnect);
+    req.removeListener('aborted', onDisconnect);
   });
 }
 
